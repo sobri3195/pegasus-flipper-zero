@@ -1,112 +1,274 @@
 #!/usr/bin/env python3
-"""
-Flipper Zero Bluetooth Keyboard Spy Script
-For monitoring nearby devices without touching or installing anything
+"""Flipper Zero + Bluetooth diagnostics utility.
 
-Requirements:
-- Latest stable firmware installed on Flipper Zero with Developer Board
+This script focuses on **local diagnostics** and observability:
+- optional Flipper serial handshake
+- Bluetooth scan for nearby devices
+- optional connection-event logging (poll-based)
+- optional RSSI inquiry output
+
+It avoids intrusive actions and requires explicit CLI flags per feature.
 """
 
-import serial
-import time
-import bluetooth
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import shlex
 import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
 
-def activate_hid_mode():
-    """Activate HID keyboard emulation mode"""
-    ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
-    
-    # Send HID activation sequence
-    hid_sequence = bytes([0x06, 0x2b, 0x85, 0x74])
-    for byte in hid_sequence:
-        ser.write(bytes([byte]))
-    
-    print("[+] Activated keyboard mode")
+try:
+    import serial  # type: ignore
+except ImportError:  # pragma: no cover - environment dependent
+    serial = None
+
+
+@dataclass(frozen=True)
+class Device:
+    """A Bluetooth device discovered by bluetoothctl."""
+
+    mac: str
+    name: str
+
+
+def run_command(cmd: list[str], *, check: bool = True) -> str:
+    """Run a command and return stdout as text.
+
+    Raises RuntimeError with a readable message when a command fails.
+    """
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=check,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Command not found: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        detail = stderr or stdout or str(exc)
+        raise RuntimeError(
+            f"Command failed ({' '.join(shlex.quote(x) for x in cmd)}): {detail}"
+        ) from exc
+
+    return completed.stdout.strip()
+
+
+def activate_hid_mode(port: str, baudrate: int = 115200, timeout: int = 1):
+    """Send a simple serial handshake sequence to the configured serial port."""
+    if serial is None:
+        raise RuntimeError(
+            "pyserial is not installed. Install it first: pip install pyserial"
+        )
+
+    ser = serial.Serial(port, baudrate, timeout=timeout)
+    hid_sequence = bytes([0x06, 0x2B, 0x85, 0x74])
+    ser.write(hid_sequence)
+    print(f"[+] Handshake sent to {port} at {baudrate} bps")
     return ser
 
-def scan_bluetooth_devices():
-    """Scan and list nearby Bluetooth devices"""
+
+def parse_devices(output: str) -> list[Device]:
+    """Parse output from `bluetoothctl devices`."""
+    devices: list[Device] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("Device "):
+            continue
+
+        # Expected format: Device XX:XX:XX:XX:XX:XX Name Here
+        parts = line.split(maxsplit=2)
+        if len(parts) < 3:
+            continue
+
+        _, mac, name = parts
+        devices.append(Device(mac=mac, name=name))
+    return devices
+
+
+def scan_bluetooth_devices(scan_seconds: int) -> list[Device]:
+    """Scan for nearby Bluetooth devices and return parsed results."""
+    print(f"[*] Scanning Bluetooth devices for {scan_seconds}s...")
+    run_command(["bluetoothctl", "scan", "on"])
     try:
-        # Start scanning
-        subprocess.run(['bluetoothctl', 'scan', 'on'], check=True)
-        
-        # Scan for 10 seconds
-        time.sleep(10)
-        
-        # Stop scanning
-        subprocess.run(['bluetoothctl', 'scan', 'off'], check=True)
-        
-        # Get device list
-        output = subprocess.check_output(
-            ['bluetoothctl', 'devices'], 
-            universal_newlines=True
-        )
-        
-        print("[+] Bluetooth devices found:")
-        for line in output.splitlines():
-            if "Device" in line:
-                parts = line.strip().split()
-                mac_addr, name = parts[2], parts[-1]
-                print(f"    {mac_addr}: {name}")
-                
-    except subprocess.CalledProcessError as e:
-        print("[-] Bluetooth scan error:", str(e))
+        time.sleep(scan_seconds)
+    finally:
+        run_command(["bluetoothctl", "scan", "off"])
 
-def main():
-    try:
-        # Activate HID mode first
-        ser = activate_hid_mode()
-        
-        # Wait for keyboard setup complete
-        time.sleep(5)
-        
-        # Scan nearby devices
-        scan_bluetooth_devices()
-        
-        # Close serial connection
-        ser.close()
-        
-    except KeyboardInterrupt:
-        print("\n[!] Exiting...")
-    
-if __name__ == "__main__":
-    main()
+    output = run_command(["bluetoothctl", "devices"])
+    devices = parse_devices(output)
 
-def track_connections():
-    """Track connections and disconnections"""
-    # Add timestamp tracking for each connection/disconnection event
-    conn_log = open('connection.log', 'a')
-    
-    def on_connection(mac_addr, name):
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        conn_log.write(f"{timestamp} - CONNECTED: {mac_addr}: {name}\n")
-        
-    # Hook into Bluetooth events
-    subprocess.Popen(['bluetoothctl', 'scan', 'on'])
+    if not devices:
+        print("[-] No Bluetooth devices discovered.")
+        return devices
 
-def measure_signal_strength():
-    """Measure signal strength of nearby devices"""
-    output = subprocess.check_output(
-        ['hcitool', 'inquiry'], 
-        universal_newlines=True
+    print(f"[+] Found {len(devices)} device(s):")
+    for item in devices:
+        print(f"    {item.mac}: {item.name}")
+    return devices
+
+
+def get_current_connections() -> set[str]:
+    """Return currently connected device MAC addresses from bluetoothctl info."""
+    devices = parse_devices(run_command(["bluetoothctl", "devices"]))
+    connected: set[str] = set()
+
+    for dev in devices:
+        info = run_command(["bluetoothctl", "info", dev.mac], check=False)
+        if "Connected: yes" in info:
+            connected.add(dev.mac)
+
+    return connected
+
+
+def track_connections(log_file: Path, duration_seconds: int, poll_interval: int) -> None:
+    """Track connection/disconnection events and append to a log file."""
+    print(
+        f"[*] Tracking connection events for {duration_seconds}s "
+        f"(interval={poll_interval}s)"
     )
-    
-    print("[+] Signal strengths:")
-    for line in output.splitlines()[1:]:  # Skip header
-        if "INQ:" not in line:
-            parts = line.strip().split()
-            mac_addr, name = parts[2], parts[-1]
-            rssi = parts[3].replace(')', '')
-            print(f"    {mac_addr}: {name} - RSSI: {rssi}")
 
-      def capture_audio():
-    """Capture audio from paired devices"""
-    # Enable microphone access through ALSA
-    subprocess.run(['amixer', 'set', 'Mic', '100%'], check=True)
-    
-    # Start recording to file
-    with open('audio.pcm', 'wb') as f:
-        subprocess.Popen(
-            ['arecord', '-f', 'S16_LE', '-r', '48000', '-d', '30'],
-            stdout=f, stderr=subprocess.DEVNULL
-        )
+    previous = get_current_connections()
+    end_time = time.time() + duration_seconds
+
+    with log_file.open("a", encoding="utf-8") as fh:
+        while time.time() < end_time:
+            time.sleep(poll_interval)
+            current = get_current_connections()
+
+            connected_now = sorted(current - previous)
+            disconnected_now = sorted(previous - current)
+
+            timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for mac in connected_now:
+                line = f"{timestamp} - CONNECTED: {mac}"
+                print(f"[+] {line}")
+                fh.write(line + "\n")
+
+            for mac in disconnected_now:
+                line = f"{timestamp} - DISCONNECTED: {mac}"
+                print(f"[-] {line}")
+                fh.write(line + "\n")
+
+            fh.flush()
+            previous = current
+
+
+def measure_signal_strength() -> None:
+    """Display RSSI lines from hcitool inquiry if available."""
+    output = run_command(["hcitool", "inquiry"], check=False)
+    if not output:
+        print("[-] No RSSI inquiry output (adapter unavailable or no devices).")
+        return
+
+    print("[+] RSSI inquiry output:")
+    for line in output.splitlines():
+        print(f"    {line}")
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Flipper Zero Bluetooth diagnostics utility"
+    )
+    parser.add_argument(
+        "--serial-port",
+        default="/dev/ttyACM0",
+        help="Serial port for Flipper handshake (default: /dev/ttyACM0)",
+    )
+    parser.add_argument(
+        "--activate-hid",
+        action="store_true",
+        help="Send handshake bytes to Flipper over serial port",
+    )
+    parser.add_argument(
+        "--scan",
+        action="store_true",
+        help="Run Bluetooth device scan",
+    )
+    parser.add_argument(
+        "--scan-seconds",
+        type=positive_int,
+        default=10,
+        help="Duration for Bluetooth scan in seconds (default: 10)",
+    )
+    parser.add_argument(
+        "--track-connections",
+        action="store_true",
+        help="Track connection/disconnection events",
+    )
+    parser.add_argument(
+        "--track-seconds",
+        type=positive_int,
+        default=30,
+        help="How long to track connections in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=positive_int,
+        default=3,
+        help="Polling interval for connection tracking (default: 3)",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=Path("connection.log"),
+        help="File path for connection logs (default: connection.log)",
+    )
+    parser.add_argument(
+        "--rssi",
+        action="store_true",
+        help="Print RSSI inquiry output (requires hcitool)",
+    )
+    return parser
+
+
+def run_selected_features(args: argparse.Namespace) -> int:
+    """Execute selected features and return process exit code."""
+    serial_conn = None
+    try:
+        if args.activate_hid:
+            serial_conn = activate_hid_mode(args.serial_port)
+
+        if args.scan:
+            scan_bluetooth_devices(args.scan_seconds)
+
+        if args.track_connections:
+            track_connections(args.log_file, args.track_seconds, args.poll_interval)
+
+        if args.rssi:
+            measure_signal_strength()
+
+        if not any((args.activate_hid, args.scan, args.track_connections, args.rssi)):
+            print("[i] No feature selected. Use --help to see available options.")
+
+        return 0
+    except RuntimeError as exc:
+        print(f"[-] {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if serial_conn is not None:
+            serial_conn.close()
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run_selected_features(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
