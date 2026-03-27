@@ -14,83 +14,26 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import shlex
-import subprocess
+import importlib
+import json
+import platform
+import socket
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-try:
-    import serial  # type: ignore
-except ImportError:  # pragma: no cover - environment dependent
-    serial = None
-
-
-@dataclass(frozen=True)
-class Device:
-    """A Bluetooth device discovered by bluetoothctl."""
-
-    mac: str
-    name: str
-
-
-def run_command(cmd: list[str], *, check: bool = True) -> str:
-    """Run a command and return stdout as text.
-
-    Raises RuntimeError with a readable message when a command fails.
-    """
-    try:
-        completed = subprocess.run(
-            cmd,
-            check=check,
-            text=True,
-            capture_output=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Command not found: {cmd[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip()
-        stdout = (exc.stdout or "").strip()
-        detail = stderr or stdout or str(exc)
-        raise RuntimeError(
-            f"Command failed ({' '.join(shlex.quote(x) for x in cmd)}): {detail}"
-        ) from exc
-
-    return completed.stdout.strip()
+from flipper_core import CommandError, Device, parse_devices, run_command
 
 
 def activate_hid_mode(port: str, baudrate: int = 115200, timeout: int = 1):
     """Send a simple serial handshake sequence to the configured serial port."""
-    if serial is None:
-        raise RuntimeError(
-            "pyserial is not installed. Install it first: pip install pyserial"
-        )
-
-    ser = serial.Serial(port, baudrate, timeout=timeout)
+    serial_module = importlib.import_module("serial")
+    ser = serial_module.Serial(port, baudrate, timeout=timeout)
     hid_sequence = bytes([0x06, 0x2B, 0x85, 0x74])
     ser.write(hid_sequence)
     print(f"[+] Handshake sent to {port} at {baudrate} bps")
     return ser
-
-
-def parse_devices(output: str) -> list[Device]:
-    """Parse output from `bluetoothctl devices`."""
-    devices: list[Device] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line.startswith("Device "):
-            continue
-
-        # Expected format: Device XX:XX:XX:XX:XX:XX Name Here
-        parts = line.split(maxsplit=2)
-        if len(parts) < 3:
-            continue
-
-        _, mac, name = parts
-        devices.append(Device(mac=mac, name=name))
-    return devices
 
 
 def scan_bluetooth_devices(scan_seconds: int) -> list[Device]:
@@ -173,6 +116,104 @@ def measure_signal_strength() -> None:
         print(f"    {line}")
 
 
+def list_paired_devices() -> list[Device]:
+    """Show paired devices from bluetoothctl."""
+    devices = parse_devices(run_command(["bluetoothctl", "paired-devices"], check=False))
+    if not devices:
+        print("[-] No paired devices found.")
+        return []
+
+    print(f"[+] Paired devices ({len(devices)}):")
+    for item in devices:
+        print(f"    {item.mac}: {item.name}")
+    return devices
+
+
+def show_adapters() -> None:
+    """Show available Bluetooth adapters and status hints."""
+    output = run_command(["bluetoothctl", "list"], check=False)
+    if not output:
+        print("[-] No adapter data from bluetoothctl list.")
+        return
+
+    print("[+] Bluetooth adapters:")
+    for line in output.splitlines():
+        print(f"    {line}")
+
+
+def set_adapter_power(power_on: bool) -> None:
+    """Turn default Bluetooth adapter power on/off."""
+    state = "on" if power_on else "off"
+    result = run_command(["bluetoothctl", "power", state], check=False)
+    print(f"[+] Adapter power {state}: {result or 'ok'}")
+
+
+def remove_device(mac: str) -> None:
+    """Remove a paired device by MAC address."""
+    result = run_command(["bluetoothctl", "remove", mac], check=False)
+    print(f"[+] Remove result for {mac}: {result or 'ok'}")
+
+
+def print_device_info(mac: str) -> None:
+    """Print detailed info for a specific MAC address."""
+    info = run_command(["bluetoothctl", "info", mac], check=False)
+    if not info:
+        print(f"[-] No info found for {mac}.")
+        return
+    print(f"[+] Device info for {mac}:")
+    for line in info.splitlines():
+        print(f"    {line}")
+
+
+def export_devices_json(output_path: Path) -> None:
+    """Export discovered devices to JSON file."""
+    devices = parse_devices(run_command(["bluetoothctl", "devices"], check=False))
+    payload = [{"mac": d.mac, "name": d.name} for d in devices]
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[+] Exported {len(payload)} device(s) to {output_path}")
+
+
+def ping_host(host: str, timeout_seconds: int) -> None:
+    """Check whether TCP/443 is reachable for a host."""
+    print(f"[*] Checking TCP connectivity to {host}:443 (timeout={timeout_seconds}s)...")
+    with socket.create_connection((host, 443), timeout=timeout_seconds):
+        print(f"[+] Host {host} reachable on port 443")
+
+
+def print_system_report() -> None:
+    """Print simple local environment report for diagnostics."""
+    uname = platform.uname()
+    report = {
+        "timestamp": dt.datetime.utcnow().isoformat() + "Z",
+        "platform": platform.platform(),
+        "system": uname.system,
+        "release": uname.release,
+        "machine": uname.machine,
+        "python": sys.version.split()[0],
+    }
+
+    hciconfig = run_command(["hciconfig"], check=False)
+    report["hciconfig_available"] = bool(hciconfig)
+    report["adapter_snapshot"] = hciconfig.splitlines()[:8] if hciconfig else []
+
+    print("[+] System report:")
+    print(json.dumps(report, indent=2))
+
+
+def monitor_devices(duration_seconds: int, poll_interval: int) -> None:
+    """Monitor discovered-device count over time."""
+    print(
+        f"[*] Monitoring device count for {duration_seconds}s "
+        f"(interval={poll_interval}s)"
+    )
+    end_time = time.time() + duration_seconds
+    while time.time() < end_time:
+        devices = parse_devices(run_command(["bluetoothctl", "devices"], check=False))
+        timestamp = dt.datetime.now().strftime("%H:%M:%S")
+        print(f"[i] {timestamp} | discovered_devices={len(devices)}")
+        time.sleep(poll_interval)
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -233,6 +274,65 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print RSSI inquiry output (requires hcitool)",
     )
+
+    # 10 new features
+    parser.add_argument(
+        "--list-paired",
+        action="store_true",
+        help="List paired Bluetooth devices",
+    )
+    parser.add_argument(
+        "--show-adapters",
+        action="store_true",
+        help="List available Bluetooth adapters",
+    )
+    parser.add_argument(
+        "--adapter-power-on",
+        action="store_true",
+        help="Turn Bluetooth adapter power on",
+    )
+    parser.add_argument(
+        "--adapter-power-off",
+        action="store_true",
+        help="Turn Bluetooth adapter power off",
+    )
+    parser.add_argument(
+        "--remove-device",
+        metavar="MAC",
+        help="Remove paired device by MAC address",
+    )
+    parser.add_argument(
+        "--device-info",
+        metavar="MAC",
+        help="Show detailed information for a device MAC address",
+    )
+    parser.add_argument(
+        "--export-devices-json",
+        type=Path,
+        metavar="PATH",
+        help="Export discovered devices to JSON file",
+    )
+    parser.add_argument(
+        "--ping-host",
+        metavar="HOST",
+        help="Check TCP connectivity to HOST on port 443",
+    )
+    parser.add_argument(
+        "--system-report",
+        action="store_true",
+        help="Print local system diagnostic report",
+    )
+    parser.add_argument(
+        "--monitor-devices",
+        action="store_true",
+        help="Monitor discovered-device count over time",
+    )
+    parser.add_argument(
+        "--ping-timeout",
+        type=positive_int,
+        default=3,
+        help="Timeout for --ping-host in seconds (default: 3)",
+    )
     return parser
 
 
@@ -252,11 +352,58 @@ def run_selected_features(args: argparse.Namespace) -> int:
         if args.rssi:
             measure_signal_strength()
 
-        if not any((args.activate_hid, args.scan, args.track_connections, args.rssi)):
+        if args.list_paired:
+            list_paired_devices()
+
+        if args.show_adapters:
+            show_adapters()
+
+        if args.adapter_power_on:
+            set_adapter_power(True)
+
+        if args.adapter_power_off:
+            set_adapter_power(False)
+
+        if args.remove_device:
+            remove_device(args.remove_device)
+
+        if args.device_info:
+            print_device_info(args.device_info)
+
+        if args.export_devices_json:
+            export_devices_json(args.export_devices_json)
+
+        if args.ping_host:
+            ping_host(args.ping_host, args.ping_timeout)
+
+        if args.system_report:
+            print_system_report()
+
+        if args.monitor_devices:
+            monitor_devices(args.track_seconds, args.poll_interval)
+
+        if not any(
+            (
+                args.activate_hid,
+                args.scan,
+                args.track_connections,
+                args.rssi,
+                args.list_paired,
+                args.show_adapters,
+                args.adapter_power_on,
+                args.adapter_power_off,
+                bool(args.remove_device),
+                bool(args.device_info),
+                bool(args.export_devices_json),
+                bool(args.ping_host),
+                args.system_report,
+                args.monitor_devices,
+            )
+        ):
             print("[i] No feature selected. Use --help to see available options.")
 
         return 0
-    except RuntimeError as exc:
+    except (CommandError, OSError, ModuleNotFoundError, ValueError) as exc:
         print(f"[-] {exc}", file=sys.stderr)
         return 1
     finally:
